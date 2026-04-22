@@ -1,4 +1,12 @@
-"""Training orchestration for learning agents."""
+"""Training orchestration for learning agents.
+
+Trains both the Q-Learning and Policy Gradient agents, then evaluates all
+four methods from the paper (Section VIII / Table II):
+  1. Fixed Pricing
+  2. Rule-Based
+  3. Q-Learning
+  4. Policy Gradient
+"""
 
 from __future__ import annotations
 
@@ -7,33 +15,33 @@ from pathlib import Path
 import json
 import time
 
-from rl_pricing.agents import ReplayQLearningAgent
+from rl_pricing.agents import PolicyGradientAgent, ReplayQLearningAgent
 from rl_pricing.config import DEFAULT_OUTPUT_DIR, PricingConfig
 from rl_pricing.environment import LoanPricingEnv
 from rl_pricing.evaluation import MetricSummary, evaluate_agent
-from rl_pricing.policies import (
-    BalancedTargetRatePolicy,
-    FixedRatePolicy,
-    ProfitGreedyPolicy,
-    RuleBasedPolicy,
-)
+from rl_pricing.policies import FixedRatePolicy, RuleBasedPolicy
 
 
 @dataclass
 class TrainingResult:
     seed: int
+    method: str           # "q_learning" or "policy_gradient"
     train_rewards: list[float]
-    final_epsilon: float
+    final_epsilon: float  # only meaningful for Q-learning; PG stores 0.0
     model_path: str
 
 
-def train_replay_q_agent(
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-agent training helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_q_learning_agent(
     seed: int,
     config: PricingConfig,
     train_episodes: int | None = None,
     output_dir: str | Path | None = None,
 ) -> tuple[ReplayQLearningAgent, TrainingResult]:
-    """Train one replay Q-learning agent."""
+    """Train one Q-learning agent for the given number of episodes."""
 
     n_train = config.train_episodes if train_episodes is None else train_episodes
     out_dir = Path(output_dir or DEFAULT_OUTPUT_DIR)
@@ -47,7 +55,7 @@ def train_replay_q_agent(
         obs = env.reset()
         agent.start_episode(obs)
         done = False
-        rewards = []
+        rewards: list[float] = []
         while not done:
             action = agent.act(obs, greedy=False)
             next_obs, reward, done = env.step(action)
@@ -55,17 +63,66 @@ def train_replay_q_agent(
             rewards.append(float(reward))
             obs = next_obs
         agent.decay_epsilon()
-        train_rewards.append(sum(rewards) / len(rewards))
+        train_rewards.append(float(sum(rewards) / len(rewards)))
 
-    model_path = out_dir / f"replay_q_seed{seed}.pkl"
+    model_path = out_dir / f"q_learning_seed{seed}.pkl"
     agent.save(model_path)
     return agent, TrainingResult(
         seed=seed,
+        method="q_learning",
         train_rewards=train_rewards,
         final_epsilon=agent.epsilon,
         model_path=str(model_path),
     )
 
+
+# Keep old name as alias so existing scripts that import it don't break
+train_replay_q_agent = train_q_learning_agent
+
+
+def train_policy_gradient_agent(
+    seed: int,
+    config: PricingConfig,
+    train_episodes: int | None = None,
+    output_dir: str | Path | None = None,
+) -> tuple[PolicyGradientAgent, TrainingResult]:
+    """Train one Policy Gradient (REINFORCE) agent."""
+
+    n_train = config.train_episodes if train_episodes is None else train_episodes
+    out_dir = Path(output_dir or DEFAULT_OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    env = LoanPricingEnv(config=config, seed=seed)
+    agent = PolicyGradientAgent(config=config, seed=seed)
+    train_rewards: list[float] = []
+
+    for _episode in range(n_train):
+        obs = env.reset()
+        agent.start_episode(obs)
+        done = False
+        rewards: list[float] = []
+        while not done:
+            action = agent.act(obs, greedy=False)
+            next_obs, reward, done = env.step(action)
+            agent.observe(obs, action, reward, next_obs, done)
+            rewards.append(float(reward))
+            obs = next_obs
+        train_rewards.append(float(sum(rewards) / len(rewards)))
+
+    model_path = out_dir / f"policy_gradient_seed{seed}.pkl"
+    agent.save(model_path)
+    return agent, TrainingResult(
+        seed=seed,
+        method="policy_gradient",
+        train_rewards=train_rewards,
+        final_epsilon=0.0,   # PG has no epsilon
+        model_path=str(model_path),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full experiment: train both RL agents, evaluate all 4 paper methods
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_full_experiment(
     config: PricingConfig,
@@ -74,7 +131,14 @@ def run_full_experiment(
     eval_episodes: int | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
-    """Train RL agents, evaluate all methods, and return serializable results."""
+    """Train RL agents, evaluate all four paper methods, return results dict.
+
+    The four methods evaluated are, in order:
+      1. Fixed Pricing    (baseline)
+      2. Rule-Based       (baseline)
+      3. Q-Learning       (RL — trained here)
+      4. Policy Gradient  (RL — trained here)
+    """
 
     selected_seeds = list(config.seeds if seeds is None else seeds)
     n_train = config.train_episodes if train_episodes is None else train_episodes
@@ -89,36 +153,38 @@ def run_full_experiment(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
-    trained_agents: dict[int, ReplayQLearningAgent] = {}
-    training_runs: list[TrainingResult] = []
+
+    # ── Train Q-Learning agents ──────────────────────────────────────────────
+    q_agents: dict[int, ReplayQLearningAgent] = {}
+    q_runs: list[TrainingResult] = []
     for seed in selected_seeds:
-        agent, result = train_replay_q_agent(
-            seed=seed,
-            config=config,
-            train_episodes=None,
-            output_dir=out_dir,
+        agent, result = train_q_learning_agent(
+            seed=seed, config=config, output_dir=out_dir
         )
-        trained_agents[seed] = agent
-        training_runs.append(result)
+        q_agents[seed] = agent
+        q_runs.append(result)
 
-    summaries: list[MetricSummary] = []
+    # ── Train Policy Gradient agents ─────────────────────────────────────────
+    pg_agents: dict[int, PolicyGradientAgent] = {}
+    pg_runs: list[TrainingResult] = []
+    for seed in selected_seeds:
+        agent, result = train_policy_gradient_agent(
+            seed=seed, config=config, output_dir=out_dir
+        )
+        pg_agents[seed] = agent
+        pg_runs.append(result)
 
-    baseline_specs = [
-        ("Fixed Pricing", lambda seed: FixedRatePolicy(config=config)),
-        ("Rule-Based", lambda seed: RuleBasedPolicy(config=config)),
-        ("Profit-Greedy Planner", lambda seed: ProfitGreedyPolicy(config=config)),
-        (
-            "Balanced Planner",
-            lambda seed: BalancedTargetRatePolicy(config=config),
-        ),
-        (
-            "Replay Q-Learning",
-            lambda seed: trained_agents[seed],
-        ),
+    # ── Evaluate all four methods ────────────────────────────────────────────
+    method_specs = [
+        ("Fixed Pricing",    lambda seed: FixedRatePolicy(config=config)),
+        ("Rule-Based",       lambda seed: RuleBasedPolicy(config=config)),
+        ("Q-Learning",       lambda seed: q_agents[seed]),
+        ("Policy Gradient",  lambda seed: pg_agents[seed]),
     ]
 
-    for method, factory in baseline_specs:
-        summary, _episodes = evaluate_agent(
+    summaries: list[MetricSummary] = []
+    for method, factory in method_specs:
+        summary, _ = evaluate_agent(
             method=method,
             factory=factory,
             config=config,
@@ -128,19 +194,23 @@ def run_full_experiment(
         )
         summaries.append(summary)
 
+    # ── Serialise results ────────────────────────────────────────────────────
+    # training list groups runs by method so the plotter can draw both curves
+    all_runs = q_runs + pg_runs
     result = {
         "config": config.__dict__,
         "runtime_seconds": time.time() - started,
         "training": [
             {
                 "seed": run.seed,
+                "method": run.method,
                 "final_epsilon": run.final_epsilon,
                 "model_path": run.model_path,
                 "train_rewards": run.train_rewards,
             }
-            for run in training_runs
+            for run in all_runs
         ],
-        "summaries": [summary.as_dict() for summary in summaries],
+        "summaries": [s.as_dict() for s in summaries],
     }
 
     results_path = out_dir / "results.json"
