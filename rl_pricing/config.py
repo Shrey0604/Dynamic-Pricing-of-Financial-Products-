@@ -110,7 +110,6 @@ class PricingConfig:
     pg_hidden2: int = 32
 
     # ── DQN hyperparameters ──────────────────────────────────────────────────
-# ── DQN hyperparameters ──────────────────────────────────────────────────
 
     dqn_lr:              float = 1e-3
     dqn_hidden1:         int   = 64
